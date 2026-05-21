@@ -5,3 +5,4 @@ requests
 plotly
 google-generativeai
 openpyxl
+pypdf
