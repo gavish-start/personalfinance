@@ -83,8 +83,8 @@ def parse_zerodha_file(uploaded_file):
             uploaded_file.seek(0)
             df = pd.read_csv(uploaded_file, skiprows=header_idx)
         
-        # Clean columns
-        df.columns = [col.strip().lstrip(',').rstrip(',') for col in df.columns]
+        # Clean columns safely converting each to string first
+        df.columns = [str(col).strip().lstrip(',').rstrip(',') for col in df.columns]
         if 'Symbol' in df.columns:
             df = df.dropna(subset=['Symbol'])
         else:
@@ -103,8 +103,10 @@ def parse_zerodha_file(uploaded_file):
 
         holdings = []
         for _, row in df.iterrows():
+            if pd.isna(row[symbol_col]):
+                continue
             symbol = str(row[symbol_col]).strip()
-            if not symbol or symbol.lower() == 'symbol' or pd.isna(row[symbol_col]):
+            if not symbol or symbol.lower() in ['symbol', 'nan']:
                 continue
             try:
                 qty = float(row[qty_col])
