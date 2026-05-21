@@ -10,7 +10,7 @@ import io
 # ==========================================
 # PAGE CONFIGURATION & THEME CUSTOMIZATION
 # ==========================================
-st.set_page_config(page_title="Global Portfolio Analyzer", page_icon="🌍", layout="wide")
+st.set_page_config(page_title="Global Portfolio Analyzer", layout="wide")
 
 # Custom CSS to force clean Zerodha-style design
 st.markdown("""
@@ -436,7 +436,7 @@ def parse_trading212_txns_for_timeline(uploaded_file):
 # ==========================================
 def process_holdings(raw_data, fx_rate):
     processed = []
-    
+
     # Stand-in dictionary of mutual fund ISIN maps for fallbacks
     isin_map = {
         "SBI Small Cap Fund Reg Growth": "INF204K01202",
@@ -466,16 +466,20 @@ def process_holdings(raw_data, fx_rate):
         # Calculate market cap categorization dynamically
         cap_cat = get_cap_category(item['name'], item['class'], item['geo'])
         
-        # Deep factsheet links logic based on asset details
+        # Dynamic factsheet links: Trendlyne for Indian Assets, Yahoo Finance for UK/Global
         factsheet_url = ""
         if item['class'] == 'Mutual Fund':
             isin = item.get('isin') or isin_map.get(item['name'])
             if isin:
-                factsheet_url = f"https://www.valueresearchonline.com/search/?q={isin}"
+                # Direct Trendlyne Mutual Fund lookup using ISIN number
+                factsheet_url = f"https://trendlyne.com/mutual-funds/results/?q={isin}"
             else:
-                factsheet_url = f"https://www.valueresearchonline.com/search/?q={item['name'].replace(' ', '+')}"
+                # Safe Search fallback on Trendlyne for Mutual Funds
+                factsheet_url = f"https://trendlyne.com/mutual-funds/results/?q={item['name'].replace(' ', '+')}"
         elif item['class'] == 'Equity' and item['geo'] == 'India':
-            factsheet_url = f"https://finance.yahoo.com/quote/{item['name']}.NS"
+            # Clean symbols (remove Yahoo NS suffix to match raw symbol formatting)
+            symbol_raw = item['name'].split('.')[0]
+            factsheet_url = f"https://trendlyne.com/equity/{symbol_raw}/"
         elif item['class'] == 'Global ETF' or (item['class'] == 'Equity' and item['geo'] == 'UK'):
             factsheet_url = f"https://finance.yahoo.com/quote/{item['name']}"
         else:
@@ -799,7 +803,7 @@ else:
             column_config={
                 "Factsheet": st.column_config.LinkColumn(
                     "Factsheet",
-                    help="Click to open the fund factsheet or asset analysis on Value Research / Yahoo Finance",
+                    help="Click to open the fund factsheet or asset analysis on Trendlyne / Yahoo Finance",
                     validate="^http",
                     display_text="View Factsheet ↗"
                 )
