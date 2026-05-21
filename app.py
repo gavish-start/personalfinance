@@ -30,6 +30,15 @@ st.markdown("""
         padding-top: 2rem;
         padding-bottom: 2rem;
     }
+    /* Clean Cards for onboarding */
+    .onboarding-card {
+        background-color: #fcfcfc;
+        border: 1px solid #e0e0e0;
+        border-left: 4px solid #387ed1;
+        padding: 20px;
+        border-radius: 4px;
+        margin-bottom: 20px;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -450,15 +459,21 @@ if run_analysis:
 st.title("Global Portfolio Analyst Dashboard")
 
 if st.session_state.df_portfolio is None:
-    # Onboarding Empty State Landing
-    st.info("Welcome to your global cross-border investment workspace.")
+    # Onboarding Empty State Landing - Minimal and Clean, No Image
     st.markdown("""
-    To generate your unified metrics:
-    1. Upload your statements on the **left sidebar** (Zerodha CSV/XLSX, CAMS Mutual Funds JSON/PDF, or Trading 212 CSV).
-    2. Alternatively, check the **'Use Demo Data'** checkbox to instantly see the ecosystem in action.
-    3. Click the red **'Run Dashboard Analysis'** button to build the report.
-    """)
-    st.image("https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?auto=format&fit=crop&w=1200&q=80", caption="Consolidate multi-currency asset values dynamically.", use_container_width=True)
+    <div class="onboarding-card">
+        <h3 style="margin-top:0; color:#387ed1; font-weight:600;">Welcome to your global cross-border investment workspace</h3>
+        <p style="color:#555; font-size:14px; margin-bottom:15px;">
+            Consolidate and track multi-currency asset values across Indian and UK platforms dynamically with real-time exchange rates and stock prices.
+        </p>
+        <h4 style="margin-top:20px; font-weight:500; color:#333; font-size:14px;">How to generate your unified metrics:</h4>
+        <ol style="color:#555; font-size:14px; padding-left:20px; line-height:1.6;">
+            <li>Upload your holding statements in the <b>left sidebar</b> (Zerodha CSV/XLSX, CAMS Mutual Funds JSON/PDF, or Trading 212 CSV).</li>
+            <li>Alternatively, toggle the <b>'Use Demo Data'</b> checkbox in the sidebar to instantly inspect the interactive workspace.</li>
+            <li>Click the blue <b>'Run Dashboard Analysis'</b> button to build your report.</li>
+        </ol>
+    </div>
+    """, unsafe_allow_html=True)
 
 elif st.session_state.df_portfolio.empty:
     st.warning("No valid transaction or holdings data extracted. Please check your uploaded statement files and click 'Run Dashboard Analysis' again.")
