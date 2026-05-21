@@ -471,14 +471,15 @@ def process_holdings(raw_data, fx_rate):
         if item['class'] == 'Mutual Fund':
             isin = item.get('isin') or isin_map.get(item['name'])
             if isin:
-                # Direct Trendlyne Mutual Fund lookup using universal search query endpoint
-                factsheet_url = f"https://trendlyne.com/search/results/?q={isin}"
+                # Direct lookup on Groww using the ISIN number (extremely reliable and clean redirect)
+                factsheet_url = f"https://groww.in/search?q={isin}"
             else:
-                # Safe Search fallback on Trendlyne for Mutual Funds using fund name
-                factsheet_url = f"https://trendlyne.com/search/results/?q={item['name'].replace(' ', '+')}"
+                # Fallback search on Groww using fund name
+                factsheet_url = f"https://groww.in/search?q={item['name'].replace(' ', '+')}"
         elif item['class'] == 'Equity' and item['geo'] == 'India':
             # Clean symbols (remove Yahoo NS suffix to match raw symbol formatting)
             symbol_raw = item['name'].split('.')[0]
+            # Direct link to Trendlyne Stock page which is 100% stable
             factsheet_url = f"https://trendlyne.com/equity/{symbol_raw}/"
         elif item['class'] == 'Global ETF' or (item['class'] == 'Equity' and item['geo'] == 'UK'):
             factsheet_url = f"https://finance.yahoo.com/quote/{item['name']}"
