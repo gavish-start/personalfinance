@@ -6,7 +6,6 @@ import json
 import plotly.express as px
 import re
 import io
-from collections import Counter
 
 # ==========================================
 # PAGE CONFIGURATION & THEME CUSTOMIZATION
@@ -72,6 +71,7 @@ def get_live_stock_price(ticker_symbol):
 
 @st.cache_data(ttl=3600)
 def get_mutual_fund_nav(scheme_name):
+    # Standard Indian AMFI mutual fund codes
     code_map = {
         "Kotak Focused Fund Gr": "147473",
         "SBI Small Cap Fund Reg Growth": "119616",
@@ -87,112 +87,7 @@ def get_mutual_fund_nav(scheme_name):
         return None
 
 # ==========================================
-# 3. HELPER RECOVERY FUNCTIONS FOR CAMS PDF
-# ==========================================
-def clean_scheme_name(name):
-    """Safely cleans out folio numbers, slashes and prefixes from scheme name."""
-    name = re.sub(r'\b\d+/\d+\b', ' ', name)
-    name = re.sub(r'\b\d{6,12}\b', ' ', name)
-    name = re.sub(r'^(?:Scheme|Fund|Name|Asset|Description|Securities)\s*[:\-]\s*', '', name, flags=re.IGNORECASE)
-    name = re.sub(r'\s+', ' ', name).strip()
-    return name
-
-def is_candidate_scheme(line):
-    """Identifies potential mutual fund lines while ignoring systemic headers/meta."""
-    line_clean = line.strip()
-    if len(line_clean) < 10 or len(line_clean) > 120:
-        return False
-        
-    if re.match(r'^\d+$', line_clean):
-        return False
-        
-    # Standard Indian Mutual Fund descriptors
-    fund_keywords = re.compile(
-        r'(?:Mutual\s+Fund|Fund|Growth|ELSS|Tax\s+Saver|Balanced|Equity|Debt|Liquid|Scheme|Option|Pln|Plan|Gr|Direct|Regular|IDCW|Dividend|Reinvestment)', 
-        re.IGNORECASE
-    )
-    if not fund_keywords.search(line_clean):
-        return False
-        
-    # Structural metadata to ignore
-    ignore_keywords = re.compile(
-        r'(?:Statement|CAS|Summary|Page|CAMS|Date|Transaction|Folio|PAN|KYC|Registrar|Note|Report|Investor|Email|Mobile|Address|Valuation|Total|Sub-Total|Nomination|Registered|Account|Holdings|Generated|Dear|Client|Customer|Folios|Closing\s+Balance|Unit\s+Balance|Balance\s+Units)', 
-        re.IGNORECASE
-    )
-    if ignore_keywords.search(line_clean):
-        return False
-        
-    return True
-
-def extract_financial_triplets(floats):
-    """
-    Given a list of floats, find relations of form A * B ≈ C.
-    The most common factor is almost certainly the Quantity (Qty).
-    Returns resolved qty, nav, market_val, cost_val and avg_cost.
-    """
-    if len(floats) < 3:
-        return None
-    
-    solutions = []
-    n = len(floats)
-    for i in range(n):
-        for j in range(n):
-            if i == j: continue
-            for k in range(n):
-                if k == i or k == j: continue
-                a, b, c = floats[i], floats[j], floats[k]
-                if a <= 1 or b <= 1 or c <= 1: continue
-                # Allow a 2.5% margin of rounding error/STT impacts
-                if abs(a * b - c) / c < 0.025:
-                    solutions.append((a, b, c))
-                    
-    if not solutions:
-        return None
-        
-    # Quantify occurrences of parameters to pull the base Qty
-    factors = []
-    for sol in solutions:
-        factors.append(sol[0])
-        factors.append(sol[1])
-        
-    counter = Counter(factors)
-    qty = counter.most_common(1)[0][0]
-    
-    cost_val = None
-    avg_cost = None
-    market_val = None
-    nav = None
-    
-    for sol in solutions:
-        if sol[0] == qty:
-            other_factor = sol[1]
-        elif sol[1] == qty:
-            other_factor = sol[0]
-        else:
-            continue
-        val = sol[2]
-        
-        # Current Value is almost always the larger product in active accounts
-        if market_val is None or val > market_val:
-            if market_val is not None:
-                cost_val = market_val
-                avg_cost = nav
-            market_val = val
-            nav = other_factor
-        else:
-            cost_val = val
-            avg_cost = other_factor
-            
-    return {
-        "qty": qty,
-        "nav": nav if nav is not None else 0.0,
-        "market_val": market_val if market_val is not None else 0.0,
-        "cost_val": cost_val,
-        "avg_cost": avg_cost
-    }
-
-# ==========================================
-# 4. RAW STATEMENT PARSERS (Robust CSV, Excel & PDF)
+# 3. RAW STATEMENT PARSERS (Robust CSV & Excel)
 # ==========================================
 def parse_zerodha_file(uploaded_file):
     try:
@@ -265,137 +160,87 @@ def parse_zerodha_file(uploaded_file):
         st.error(f"Error parsing Zerodha statement: {e}")
         return []
 
-def parse_cams_file(uploaded_file):
+def parse_cams_excel(uploaded_file):
+    """Parses CAMS holdings workbook sheet 'Summary' or dynamic CSV layouts."""
     try:
-        data = json.load(uploaded_file)
-        holdings = []
-        for item in data:
-            qty = float(item.get('UnitBal', 0))
-            cost_val = float(item.get('CostValue', 0))
-            current_val = float(item.get('CurrentValue', 0))
-            scheme_name = item.get('Scheme', 'Unknown Fund')
+        if uploaded_file.name.endswith('.csv'):
+            lines = uploaded_file.getvalue().decode("utf-8").split("\n")
+            header_idx = 0
+            for i, line in enumerate(lines):
+                if "FundName" in line or "Fund Name" in line:
+                    header_idx = i
+                    break
+            uploaded_file.seek(0)
+            df = pd.read_csv(uploaded_file, skiprows=header_idx)
+        else:
+            xls = pd.ExcelFile(uploaded_file)
+            sheet_name = 'Summary' if 'Summary' in xls.sheet_names else xls.sheet_names[0]
+            df_raw = pd.read_excel(xls, sheet_name=sheet_name, header=None)
             
-            avg_cost = cost_val / qty if qty > 0 else 0
-            current_price = current_val / qty if qty > 0 else 0
+            header_idx = None
+            for idx, row in df_raw.iterrows():
+                if row.astype(str).str.contains("FundName|Fund Name", case=False, na=False).any():
+                    header_idx = idx
+                    break
             
-            holdings.append({
-                'name': scheme_name,
-                'class': 'Mutual Fund',
-                'geo': 'India',
-                'qty': qty,
-                'avgCost': avg_cost,
-                'currentPrice': current_price,
-                'currency': 'INR',
-                'source': 'CAMS'
-            })
-        return holdings
-    except Exception as e:
-        st.error(f"Error parsing CAMS JSON statement: {e}")
-        return []
-
-def parse_cams_pdf(uploaded_file, password=""):
-    try:
-        import pypdf
-    except ImportError:
-        st.error("Please add 'pypdf' to your requirements.txt on GitHub to support CAMS PDF file uploads.")
-        return []
-    
-    try:
-        # Reset memory pointer and build isolated buffer
-        uploaded_file.seek(0)
-        file_bytes = io.BytesIO(uploaded_file.read())
-        reader = pypdf.PdfReader(file_bytes)
-        
-        if reader.is_encrypted:
-            if password:
-                # Attempt with stripped password first, then fallback to original raw password
-                decrypt_result = reader.decrypt(password.strip())
-                if decrypt_result == 0:
-                    decrypt_result = reader.decrypt(password)
-                
-                # Check for absolute encryption failure
-                if decrypt_result == 0:
-                    st.error("Authentication failed: Incorrect password for CAMS PDF. Usually, this is your PAN in UPPERCASE or your email.")
-                    return []
+            if header_idx is not None:
+                headers = df_raw.iloc[header_idx].astype(str).str.strip().tolist()
+                df = df_raw.iloc[header_idx + 1:].copy()
+                df.columns = headers
             else:
-                st.warning("This CAMS PDF statement is encrypted. Please enter the password in the sidebar.")
-                return []
-                
-        full_text = ""
-        for page in reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                full_text += page_text + "\n"
-                
-        lines = [line.strip() for line in full_text.split('\n') if line.strip()]
-        holdings = []
+                df = pd.read_excel(xls, sheet_name=sheet_name)
         
-        for i, line in enumerate(lines):
-            if is_candidate_scheme(line):
-                scheme_name = clean_scheme_name(line)
-                
-                # Combine this line and the next 5 lines for a sliding context window
-                window_lines = lines[i:min(i+6, len(lines))]
-                context_text = " ".join(window_lines)
-                
-                # Clean text to prevent date and folio numbers from parsing as floats
-                context_clean = re.sub(r'\b\d{1,2}[-/\s](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[-/\s]\d{2,4}\b', ' ', context_text, flags=re.IGNORECASE)
-                context_clean = re.sub(r'\b\d{1,2}[-/\s]\d{1,2}[-/\s]\d{2,4}\b', ' ', context_clean)
-                context_clean = re.sub(r'\b\d+/\d+\b', ' ', context_clean)
-                
-                # Extract all financial decimal floats from context window
-                raw_numbers = re.findall(r'\b(?:Rs\.?|₹)?\s*[\d,]+(?:\.\d+)?\b', context_clean, re.IGNORECASE)
-                floats = []
-                for num in raw_numbers:
-                    clean_num = re.sub(r'[^\d.]', '', num)
-                    if clean_num:
-                        try:
-                            val = float(clean_num)
-                            # Skip common noise metrics (like current years)
-                            if val not in [2024.0, 2025.0, 2026.0]:
-                                floats.append(val)
-                        except ValueError:
-                            pass
-                
-                # Apply high-fidelity mathematical parser
-                resolved = extract_financial_triplets(floats)
-                
-                if resolved:
-                    qty = resolved["qty"]
-                    nav = resolved["nav"]
-                    market_val = resolved["market_val"]
-                    cost_val = resolved["cost_val"]
-                    avg_cost = resolved["avg_cost"]
-                    
-                    # Cost basis recovery logic if the invested capital formula is missing a specific rate
-                    if cost_val is None:
-                        # Extract any alternate large float representing total investment cost
-                        possible_costs = [f for f in floats if f > qty and f > nav and abs(f - market_val) / market_val > 0.05]
-                        if possible_costs:
-                            cost_val = possible_costs[0]
-                            avg_cost = cost_val / qty if qty > 0 else nav
-                        else:
-                            # Safely fallback to equal performance (Current Net Valuation)
-                            avg_cost = nav
-                            cost_val = qty * nav
-                    
-                    current_price = nav if nav > 0 else avg_cost
-                    
-                    if not any(h['name'] == scheme_name for h in holdings):
-                        holdings.append({
-                            'name': scheme_name,
-                            'class': 'Mutual Fund',
-                            'geo': 'India',
-                            'qty': qty,
-                            'avgCost': avg_cost,
-                            'currentPrice': current_price,
-                            'currency': 'INR',
-                            'source': 'CAMS'
-                        })
-                        
+        # Clean columns
+        df.columns = [str(col).strip().lstrip(',').rstrip(',') for col in df.columns]
+        
+        # Safely align scheme name column
+        if 'FundName' in df.columns:
+            df = df.dropna(subset=['FundName'])
+        elif 'Fund Name' in df.columns:
+            df = df.dropna(subset=['Fund Name'])
+            df = df.rename(columns={'Fund Name': 'FundName'})
+        else:
+            candidates = [c for c in df.columns if 'fund' in c.lower()]
+            if candidates:
+                df = df.dropna(subset=[candidates[0]])
+                df = df.rename(columns={candidates[0]: 'FundName'})
+        
+        fund_col = 'FundName'
+        qty_col = [c for c in df.columns if 'Available Units' in c or 'Units' in c]
+        qty_col = qty_col[0] if qty_col else 'Available Units'
+        
+        avg_col = [c for c in df.columns if 'Average NAV' in c or 'Avg. NAV' in c or 'WtgAvg' in c]
+        avg_col = avg_col[0] if avg_col else 'Average NAV'
+        
+        current_col = [c for c in df.columns if 'Current NAV' in c or 'NAV' in c]
+        current_col = current_col[0] if current_col else 'Current NAV'
+        
+        holdings = []
+        for _, row in df.iterrows():
+            fund_name = str(row[fund_col]).strip()
+            if not fund_name or fund_name.lower() in ['fundname', 'fund name', 'total', 'nan'] or 'total' in fund_name.lower():
+                continue
+            try:
+                qty = float(str(row[qty_col]).replace(',', ''))
+                avg_cost = float(str(row[avg_col]).replace(',', ''))
+                current_price = float(str(row[current_col]).replace(',', ''))
+            except (ValueError, TypeError, KeyError):
+                continue
+            
+            if qty > 0:
+                holdings.append({
+                    'name': fund_name,
+                    'class': 'Mutual Fund',
+                    'geo': 'India',
+                    'qty': qty,
+                    'avgCost': avg_cost,
+                    'currentPrice': current_price,
+                    'currency': 'INR',
+                    'source': 'CAMS'
+                })
         return holdings
     except Exception as e:
-        st.error(f"Error reading CAMS PDF file: {e}")
+        st.error(f"Error parsing CAMS file: {e}")
         return []
 
 def parse_trading212_file(uploaded_file):
@@ -465,7 +310,7 @@ def parse_trading212_file(uploaded_file):
         return []
 
 # ==========================================
-# 5. PROCESSING PIPELINE
+# 4. PROCESSING PIPELINE
 # ==========================================
 def process_holdings(raw_data, fx_rate):
     processed = []
@@ -506,7 +351,7 @@ def process_holdings(raw_data, fx_rate):
     return pd.DataFrame(processed).sort_values(by="Current Value (INR)", ascending=False)
 
 # ==========================================
-# 6. SIDEBAR / CONFIGURATIONS & FILTERS
+# 5. SIDEBAR / CONFIGURATIONS & FILTERS
 # ==========================================
 st.sidebar.title("Portfolio Settings")
 
@@ -537,12 +382,7 @@ st.sidebar.markdown("---")
 
 st.sidebar.subheader("Upload Holdings Statements")
 zerodha_file = st.sidebar.file_uploader("Zerodha Equity (CSV or XLSX)", type=['csv', 'xlsx', 'xls'])
-cams_file = st.sidebar.file_uploader("CAMS Mutual Funds (JSON or PDF)", type=['json', 'pdf'])
-
-cams_password = ""
-if cams_file and cams_file.name.endswith('.pdf'):
-    cams_password = st.sidebar.text_input("CAMS PDF Password", type="password", help="Enter PAN (UPPERCASE) or your registered email address.")
-
+cams_file = st.sidebar.file_uploader("CAMS Mutual Funds (XLSX or CSV)", type=['xlsx', 'xls', 'csv'])
 t212_file = st.sidebar.file_uploader("Trading 212 (CSV)", type=['csv'])
 
 use_demo = st.sidebar.checkbox("Use Demo Data", value=False)
@@ -579,10 +419,7 @@ if run_analysis:
             if zerodha_file:
                 raw_holdings.extend(parse_zerodha_file(zerodha_file))
             if cams_file:
-                if cams_file.name.endswith('.pdf'):
-                    raw_holdings.extend(parse_cams_pdf(cams_file, cams_password))
-                else:
-                    raw_holdings.extend(parse_cams_file(cams_file))
+                raw_holdings.extend(parse_cams_excel(cams_file))
             if t212_file:
                 raw_holdings.extend(parse_trading212_file(t212_file))
         
@@ -606,7 +443,7 @@ if st.session_state.df_portfolio is None:
         </p>
         <h4 style="margin-top:20px; font-weight:500; color:#333; font-size:14px;">How to generate your unified metrics:</h4>
         <ol style="color:#555; font-size:14px; padding-left:20px; line-height:1.6;">
-            <li>Upload your holding statements in the <b>left sidebar</b> (Zerodha CSV/XLSX, CAMS Mutual Funds JSON/PDF, or Trading 212 CSV).</li>
+            <li>Upload your holding statements in the <b>left sidebar</b> (Zerodha CSV/XLSX, CAMS Mutual Funds XLSX/CSV, or Trading 212 CSV).</li>
             <li>Alternatively, toggle the <b>'Use Demo Data'</b> checkbox in the sidebar to instantly inspect the interactive workspace.</li>
             <li>Click the blue <b>'Run Dashboard Analysis'</b> button to build your report.</li>
         </ol>
@@ -689,7 +526,7 @@ else:
         display_df["Geography"] = df_filtered["Geo"]
         display_df["Source"] = df_filtered["Source"]
         
-        # Request 4: Limit Qty to 0 decimals
+        # Request: Limit Qty to 0 decimals
         display_df["Qty"] = df_filtered["Qty"].apply(lambda x: f"{round(x):,}")
         
         # Pricing with local currency symbols for accuracy (retains 2 decimals where standard)
@@ -700,7 +537,7 @@ else:
         display_df["Avg Purchase Cost"] = df_filtered.apply(lambda r: format_cost_ltp(r, "Avg Cost"), axis=1)
         display_df["LTP (Current)"] = df_filtered.apply(lambda r: format_cost_ltp(r, "LTP"), axis=1)
         
-        # Dynamic Converted Value representations (rounded to integers per Request 4)
+        # Dynamic Converted Value representations (rounded to integers)
         inv_col = f"Invested Value ({display_currency})"
         cur_col = f"Current Value ({display_currency})"
         pnl_col = f"P&L ({display_currency})"
