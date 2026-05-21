@@ -48,6 +48,8 @@ st.markdown("""
 # ==========================================
 if "df_portfolio" not in st.session_state:
     st.session_state.df_portfolio = None
+if "df_timeline" not in st.session_state:
+    st.session_state.df_timeline = None
 if "fx_rate" not in st.session_state:
     st.session_state.fx_rate = 105.80
 
@@ -87,7 +89,37 @@ def get_mutual_fund_nav(scheme_name):
         return None
 
 # ==========================================
-# 3. RAW STATEMENT PARSERS (Robust CSV & Excel)
+# 3. HELPER CATEGORIZATION UTILITY
+# ==========================================
+def get_cap_category(name, asset_class, geo):
+    """Dynamically maps any stock, ETF, or fund to a market cap or global segment."""
+    name_lower = name.lower()
+    if 'cash' in name_lower:
+        return 'Cash'
+        
+    # Global Asset mapping (including ETFs and international holdings)
+    if (geo == 'UK' or 'vanguard' in name_lower or 'vwrp' in name_lower or 
+        '.l' in name_lower or 'global' in name_lower or 'us tech' in name_lower or 
+        'nasdaq' in name_lower or 'mon100' in name_lower or 'sp500' in name_lower):
+        return 'Global Funds'
+        
+    # Small Cap assets
+    if 'small' in name_lower or 'smallcap' in name_lower:
+        return 'Small Cap'
+        
+    # Mid Cap assets
+    if 'mid' in name_lower or 'midcap' in name_lower or 'idfcfirstb' in name_lower or 'granules' in name_lower:
+        return 'Mid Cap'
+        
+    # Default fallback mapping based on standard Large Cap assets or Equity class
+    if (asset_class == 'Equity' or 'large' in name_lower or 
+        'focused' in name_lower or 'elss' in name_lower or 'bluechip' in name_lower):
+        return 'Large Cap'
+        
+    return 'Multi Cap / Other'
+
+# ==========================================
+# 4. RAW STATEMENT PARSERS (Robust CSV & Excel)
 # ==========================================
 def parse_zerodha_file(uploaded_file):
     try:
@@ -215,6 +247,10 @@ def parse_cams_excel(uploaded_file):
         current_col = [c for c in df.columns if 'Current NAV' in c or 'NAV' in c]
         current_col = current_col[0] if current_col else 'Current NAV'
         
+        # Capture ISIN values if present
+        isin_col = [c for c in df.columns if 'isin' in c.lower() or 'isin number' in c.lower()]
+        isin_col = isin_col[0] if isin_col else None
+        
         holdings = []
         for _, row in df.iterrows():
             fund_name = str(row[fund_col]).strip()
@@ -227,6 +263,8 @@ def parse_cams_excel(uploaded_file):
             except (ValueError, TypeError, KeyError):
                 continue
             
+            isin_val = str(row[isin_col]).strip() if isin_col and pd.notna(row[isin_col]) else None
+            
             if qty > 0:
                 holdings.append({
                     'name': fund_name,
@@ -236,11 +274,67 @@ def parse_cams_excel(uploaded_file):
                     'avgCost': avg_cost,
                     'currentPrice': current_price,
                     'currency': 'INR',
-                    'source': 'CAMS'
+                    'source': 'CAMS',
+                    'isin': isin_val if isin_val and isin_val.lower() != 'nan' else None
                 })
         return holdings
     except Exception as e:
         st.error(f"Error parsing CAMS file: {e}")
+        return []
+
+def parse_cams_details_for_timeline(uploaded_file):
+    """Parses transaction logs on 'Details' sheet for chronological cash flows."""
+    try:
+        if uploaded_file.name.endswith('.csv'):
+            lines = uploaded_file.getvalue().decode("utf-8").split("\n")
+            header_idx = None
+            for i, line in enumerate(lines):
+                if "Transaction Date" in line:
+                    header_idx = i
+                    break
+            if header_idx is None:
+                return []
+            uploaded_file.seek(0)
+            df = pd.read_csv(uploaded_file, skiprows=header_idx)
+        else:
+            xls = pd.ExcelFile(uploaded_file)
+            if 'Details' not in xls.sheet_names:
+                return []
+            df_raw = pd.read_excel(xls, sheet_name='Details', header=None)
+            header_idx = None
+            for idx, row in df_raw.iterrows():
+                if row.astype(str).str.contains("Transaction Date", case=False, na=False).any():
+                    header_idx = idx
+                    break
+            if header_idx is None:
+                return []
+            headers = df_raw.iloc[header_idx].astype(str).str.strip().tolist()
+            df = df_raw.iloc[header_idx + 1:].copy()
+            df.columns = headers
+            
+        df.columns = [str(col).strip().lstrip(',').rstrip(',') for col in df.columns]
+        df = df.dropna(subset=['Transaction Date', 'Amount'])
+        
+        txns = []
+        for _, row in df.iterrows():
+            date_str = str(row['Transaction Date']).strip()
+            if date_str.lower() in ['transaction date', 'nan', '']:
+                continue
+            try:
+                tx_date = pd.to_datetime(date_str).strftime('%Y-%m-%d')
+                amount = float(str(row['Amount']).replace(',', ''))
+            except:
+                continue
+            
+            # Record deposits (buys/additional cash contributions)
+            if amount > 0:
+                txns.append({
+                    'date': tx_date,
+                    'amount_inr': amount,
+                    'source': 'CAMS'
+                })
+        return txns
+    except:
         return []
 
 def parse_trading212_file(uploaded_file):
@@ -309,11 +403,47 @@ def parse_trading212_file(uploaded_file):
         st.error(f"Error parsing Trading 212 statement: {e}")
         return []
 
+def parse_trading212_txns_for_timeline(uploaded_file):
+    """Parses Trading 212 cash deposits for ISA chronological contributions."""
+    try:
+        uploaded_file.seek(0)
+        df = pd.read_csv(uploaded_file)
+        if 'Time' in df.columns:
+            df = df.sort_values(by='Time')
+            
+        txns = []
+        for _, row in df.iterrows():
+            action = str(row.get('Action', '')).strip()
+            total = float(row.get('Total', 0))
+            time_str = str(row.get('Time', '')).strip()
+            
+            if action == 'Deposit' and total > 0:
+                try:
+                    tx_date = pd.to_datetime(time_str).strftime('%Y-%m-%d')
+                    txns.append({
+                        'date': tx_date,
+                        'amount_gbp': total,
+                        'source': 'Trading 212'
+                    })
+                except:
+                    continue
+        return txns
+    except:
+        return []
+
 # ==========================================
-# 4. PROCESSING PIPELINE
+# 5. PROCESSING PIPELINE
 # ==========================================
 def process_holdings(raw_data, fx_rate):
     processed = []
+    
+    # Stand-in dictionary of mutual fund ISIN maps for fallbacks
+    isin_map = {
+        "SBI Small Cap Fund Reg Growth": "INF204K01202",
+        "Kotak Focused Fund Gr": "INF204K01RU2",
+        "Kotak ELSS Tax Saver Fund - Gr": "INF174K01LS2"
+    }
+
     for item in raw_data:
         rate = fx_rate if item['currency'] == 'GBP' else 1
         
@@ -332,6 +462,24 @@ def process_holdings(raw_data, fx_rate):
         current_val = (item['qty'] * current_price) * rate
         pnl = current_val - total_invested
         pnl_pct = (pnl / total_invested) * 100 if total_invested > 0 else 0
+        
+        # Calculate market cap categorization dynamically
+        cap_cat = get_cap_category(item['name'], item['class'], item['geo'])
+        
+        # Deep factsheet links logic based on asset details
+        factsheet_url = ""
+        if item['class'] == 'Mutual Fund':
+            isin = item.get('isin') or isin_map.get(item['name'])
+            if isin:
+                factsheet_url = f"https://www.valueresearchonline.com/search/?q={isin}"
+            else:
+                factsheet_url = f"https://www.valueresearchonline.com/search/?q={item['name'].replace(' ', '+')}"
+        elif item['class'] == 'Equity' and item['geo'] == 'India':
+            factsheet_url = f"https://finance.yahoo.com/quote/{item['name']}.NS"
+        elif item['class'] == 'Global ETF' or (item['class'] == 'Equity' and item['geo'] == 'UK'):
+            factsheet_url = f"https://finance.yahoo.com/quote/{item['name']}"
+        else:
+            factsheet_url = f"https://finance.yahoo.com/quote/{item['name']}"
 
         processed.append({
             "Asset": item['name'],
@@ -345,13 +493,49 @@ def process_holdings(raw_data, fx_rate):
             "Current Value (INR)": current_val,
             "P&L (INR)": pnl,
             "P&L %": pnl_pct,
-            "Source": item.get('source', 'Unknown')
+            "Source": item.get('source', 'Unknown'),
+            "Cap Category": cap_cat,
+            "Factsheet": factsheet_url
         })
     
     return pd.DataFrame(processed).sort_values(by="Current Value (INR)", ascending=False)
 
+
+def process_timeline(cams_txns, t212_txns, fx_rate):
+    """Aggregates chronological buy records to generate a cumulative deployed cash flow timeline."""
+    records = []
+    
+    # 1. Parse CAMS deposits
+    for tx in cams_txns:
+        records.append({
+            'date': tx['date'],
+            'amount_inr': tx['amount_inr'],
+            'source': 'CAMS'
+        })
+        
+    # 2. Parse Trading 212 ISA cash transfers
+    for tx in t212_txns:
+        records.append({
+            'date': tx['date'],
+            'amount_inr': tx['amount_gbp'] * fx_rate,
+            'source': 'Trading 212'
+        })
+        
+    if not records:
+        return pd.DataFrame()
+        
+    df = pd.DataFrame(records)
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values(by='date')
+    
+    # Dynamic chronological cumsum grouped by source partitions
+    df['Cumulative (INR)'] = df['amount_inr'].cumsum()
+    df['Cumulative (GBP)'] = df['Cumulative (INR)'] / fx_rate
+    
+    return df
+
 # ==========================================
-# 5. SIDEBAR / CONFIGURATIONS & FILTERS
+# 6. SIDEBAR / CONFIGURATIONS & FILTERS
 # ==========================================
 st.sidebar.title("Portfolio Settings")
 
@@ -385,24 +569,6 @@ zerodha_file = st.sidebar.file_uploader("Zerodha Equity (CSV or XLSX)", type=['c
 cams_file = st.sidebar.file_uploader("CAMS Mutual Funds (XLSX or CSV)", type=['xlsx', 'xls', 'csv'])
 t212_file = st.sidebar.file_uploader("Trading 212 (CSV)", type=['csv'])
 
-use_demo = st.sidebar.checkbox("Use Demo Data", value=False)
-
-# Demo raw holdings fallback with explicit sources mapped
-demo_raw_holdings = [
-    { 'name': 'ASIANPAINT', 'class': 'Equity', 'geo': 'India', 'qty': 15, 'avgCost': 2583.93, 'currentPrice': 2600.70, 'currency': 'INR', 'source': 'Zerodha' },
-    { 'name': 'BAJFINANCE', 'class': 'Equity', 'geo': 'India', 'qty': 70, 'avgCost': 629.85, 'currentPrice': 923.55, 'currency': 'INR', 'source': 'Zerodha' },
-    { 'name': 'DMART', 'class': 'Equity', 'geo': 'India', 'qty': 17, 'avgCost': 3305.23, 'currentPrice': 4236.00, 'currency': 'INR', 'source': 'Zerodha' },
-    { 'name': 'GRANULES', 'class': 'Equity', 'geo': 'India', 'qty': 30, 'avgCost': 345.63, 'currentPrice': 766.45, 'currency': 'INR', 'source': 'Zerodha' },
-    { 'name': 'HCLTECH', 'class': 'Equity', 'geo': 'India', 'qty': 10, 'avgCost': 1100.00, 'currentPrice': 1350.50, 'currency': 'INR', 'source': 'Zerodha' },
-    { 'name': 'HDFCBANK', 'class': 'Equity', 'geo': 'India', 'qty': 50, 'avgCost': 1450.00, 'currentPrice': 1520.30, 'currency': 'INR', 'source': 'Zerodha' },
-    { 'name': 'IDFCFIRSTB', 'class': 'Equity', 'geo': 'India', 'qty': 200, 'avgCost': 75.50, 'currentPrice': 82.10, 'currency': 'INR', 'source': 'Zerodha' },
-    { 'name': 'SBI Small Cap Fund Reg Growth', 'class': 'Mutual Fund', 'geo': 'India', 'qty': 4217.94, 'avgCost': 59.56, 'currentPrice': 164.51, 'currency': 'INR', 'source': 'CAMS' },
-    { 'name': 'Kotak Focused Fund Gr', 'class': 'Mutual Fund', 'geo': 'India', 'qty': 6350.46, 'avgCost': 16.59, 'currentPrice': 25.73, 'currency': 'INR', 'source': 'CAMS' },
-    { 'name': 'Kotak ELSS Tax Saver Fund - Gr', 'class': 'Mutual Fund', 'geo': 'India', 'qty': 837.64, 'avgCost': 119.38, 'currentPrice': 110.08, 'currency': 'INR', 'source': 'CAMS' },
-    { 'name': 'VWRP.L', 'class': 'Global ETF', 'geo': 'UK', 'qty': 3.3722, 'avgCost': 127.89, 'currentPrice': 131.20, 'currency': 'GBP', 'source': 'Trading 212' },
-    { 'name': 'Uninvested Cash (ISA)', 'class': 'Cash', 'geo': 'UK', 'qty': 2568.70, 'avgCost': 1.00, 'currentPrice': 1.00, 'currency': 'GBP', 'source': 'Trading 212' }
-]
-
 st.sidebar.markdown("---")
 run_analysis = st.sidebar.button("Run Dashboard Analysis", use_container_width=True, type="primary")
 
@@ -413,20 +579,29 @@ if run_analysis:
         st.session_state.fx_rate = fx
         
         raw_holdings = []
-        if use_demo:
-            raw_holdings = demo_raw_holdings
-        else:
-            if zerodha_file:
-                raw_holdings.extend(parse_zerodha_file(zerodha_file))
-            if cams_file:
-                raw_holdings.extend(parse_cams_excel(cams_file))
-            if t212_file:
-                raw_holdings.extend(parse_trading212_file(t212_file))
+        cams_txns = []
+        t212_txns = []
+        
+        if zerodha_file:
+            raw_holdings.extend(parse_zerodha_file(zerodha_file))
+        if cams_file:
+            raw_holdings.extend(parse_cams_excel(cams_file))
+            # Collect transaction detail list for timeline progression
+            cams_txns.extend(parse_cams_details_for_timeline(cams_file))
+        if t212_file:
+            raw_holdings.extend(parse_trading212_file(t212_file))
+            t212_txns.extend(parse_trading212_txns_for_timeline(t212_file))
         
         if raw_holdings:
             st.session_state.df_portfolio = process_holdings(raw_holdings, fx)
         else:
             st.session_state.df_portfolio = pd.DataFrame()
+            
+        # Parse timeline datasets chronologically
+        if cams_txns or t212_txns:
+            st.session_state.df_timeline = process_timeline(cams_txns, t212_txns, fx)
+        else:
+            st.session_state.df_timeline = pd.DataFrame()
 
 # ==========================================
 # 7. MAIN PANEL VIEWPORT (Kite Blue Theme)
@@ -444,7 +619,6 @@ if st.session_state.df_portfolio is None:
         <h4 style="margin-top:20px; font-weight:500; color:#333; font-size:14px;">How to generate your unified metrics:</h4>
         <ol style="color:#555; font-size:14px; padding-left:20px; line-height:1.6;">
             <li>Upload your holding statements in the <b>left sidebar</b> (Zerodha CSV/XLSX, CAMS Mutual Funds XLSX/CSV, or Trading 212 CSV).</li>
-            <li>Alternatively, toggle the <b>'Use Demo Data'</b> checkbox in the sidebar to instantly inspect the interactive workspace.</li>
             <li>Click the blue <b>'Run Dashboard Analysis'</b> button to build your report.</li>
         </ol>
     </div>
@@ -495,7 +669,7 @@ else:
         st.markdown("---")
         
         # Visual Layout (Allocation Pie Charts using clean corporate blues)
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         
         # Consistent Zerodha Blue Palette representation
         corporate_palette = ['#387ed1', '#244e8a', '#1d3557', '#457b9d', '#a8dadc']
@@ -509,6 +683,14 @@ else:
             st.plotly_chart(fig_class, use_container_width=True)
 
         with c2:
+            st.subheader("Allocation by Cap / Category")
+            fig_cap = px.pie(df_filtered, values='Current Value (INR)', names='Cap Category', hole=0.45,
+                             color_discrete_sequence=['#1d3557', '#387ed1', '#457b9d', '#244e8a', '#9cb4cc', '#e2e8f0'])
+            fig_cap.update_traces(textposition='inside', textinfo='percent+label')
+            fig_cap.update_layout(showlegend=False, margin=dict(t=10, b=10, l=10, r=10))
+            st.plotly_chart(fig_cap, use_container_width=True)
+
+        with c3:
             st.subheader("Allocation by Geography")
             fig_geo = px.pie(df_filtered, values='Current Value (INR)', names='Geo', hole=0.45,
                              color_discrete_sequence=['#387ed1', '#9cb4cc'])
@@ -517,12 +699,41 @@ else:
             st.plotly_chart(fig_geo, use_container_width=True)
 
         st.markdown("---")
+        
+        # Historical Capital Deployment Timeline Chart
+        df_timeline = st.session_state.df_timeline
+        if df_timeline is not None and not df_timeline.empty:
+            st.subheader("Historical Capital Deployment Timeline")
+            
+            # Select correct display metrics column dynamically
+            timeline_y = f"Cumulative ({display_currency})"
+            
+            fig_timeline = px.area(
+                df_timeline,
+                x='date',
+                y=timeline_y,
+                color='source',
+                labels={timeline_y: f"Capital Deployed ({display_currency})", 'date': 'Timeline'},
+                color_discrete_sequence=['#387ed1', '#244e8a', '#1d3557']
+            )
+            fig_timeline.update_layout(
+                hovermode='x unified',
+                xaxis_title="",
+                yaxis_title=f"Cumulative Capital Deployed ({display_currency})",
+                legend_title="Investment Source",
+                margin=dict(t=10, b=10, l=10, r=10),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+            st.plotly_chart(fig_timeline, use_container_width=True)
+            st.markdown("---")
+
         st.subheader("Detailed Position Ledger")
         
         # Pre-formatting displays into strings to ensure strictly rounded accounting values
         display_df = pd.DataFrame()
         display_df["Asset Name"] = df_filtered["Asset"]
         display_df["Asset Class"] = df_filtered["Class"]
+        display_df["Category / Cap"] = df_filtered["Cap Category"]
         display_df["Geography"] = df_filtered["Geo"]
         display_df["Source"] = df_filtered["Source"]
         
@@ -565,6 +776,7 @@ else:
 
         display_df[pnl_col] = df_filtered["P&L (INR)"].apply(format_row_pnl)
         display_df["P&L %"] = df_filtered["P&L %"].apply(format_row_pct)
+        display_df["Factsheet"] = df_filtered["Factsheet"]
         
         # Dynamic numerical column subset for alignment configurations
         numerical_cols = ["Qty", "Avg Purchase Cost", "LTP (Current)", inv_col, cur_col, pnl_col, "P&L %"]
@@ -580,4 +792,16 @@ else:
             subset=numerical_cols
         )
         
-        st.dataframe(styled_df, use_container_width=True, hide_index=True)
+        st.dataframe(
+            styled_df, 
+            use_container_width=True, 
+            hide_index=True,
+            column_config={
+                "Factsheet": st.column_config.LinkColumn(
+                    "Factsheet",
+                    help="Click to open the fund factsheet or asset analysis on Value Research / Yahoo Finance",
+                    validate="^http",
+                    display_text="View Factsheet ↗"
+                )
+            }
+        )
