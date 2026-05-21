@@ -4,3 +4,4 @@ yfinance
 requests
 plotly
 google-generativeai
+openpyxl
