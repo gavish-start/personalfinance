@@ -5,6 +5,7 @@ import requests
 import json
 import plotly.express as px
 import re
+import io
 
 # ==========================================
 # PAGE CONFIGURATION & THEME CUSTOMIZATION
@@ -194,12 +195,20 @@ def parse_cams_pdf(uploaded_file, password=""):
         return []
     
     try:
-        reader = pypdf.PdfReader(uploaded_file)
+        # Reset memory pointer and build isolated buffer
+        uploaded_file.seek(0)
+        file_bytes = io.BytesIO(uploaded_file.read())
+        reader = pypdf.PdfReader(file_bytes)
+        
         if reader.is_encrypted:
             if password:
-                try:
-                    reader.decrypt(password.strip())
-                except:
+                # Attempt with stripped password first, then fallback to original raw password
+                decrypt_result = reader.decrypt(password.strip())
+                if decrypt_result == 0:
+                    decrypt_result = reader.decrypt(password)
+                
+                # Check for absolute encryption failure
+                if decrypt_result == 0:
                     st.error("Authentication failed: Incorrect password for CAMS PDF. Usually, this is your PAN in UPPERCASE or your email.")
                     return []
             else:
@@ -220,40 +229,79 @@ def parse_cams_pdf(uploaded_file, password=""):
         current_scheme = None
         
         for i, line in enumerate(lines):
+            # Cleanly capture potential mutual fund scheme name
             if fund_keywords.search(line) and not ignore_keywords.search(line) and 8 < len(line) < 100:
-                current_scheme = line
+                cleaned_line = re.sub(r'^(?:Scheme|Fund|Name|Asset|Description)\s*[:\-]\s*', '', line, flags=re.IGNORECASE).strip()
+                current_scheme = cleaned_line
                 
+            qty = None
+            # Scan for explicit closing unit balances
             balance_match = re.search(r'(?:Closing\s+Unit\s+Balance|Closing\s+Balance|Balance\s+Units|Balance|Units)\s*[:\-]?\s*([\d,]+\.\d{2,4})', line, re.IGNORECASE)
-            if balance_match and current_scheme:
+            
+            if balance_match:
                 try:
                     qty = float(balance_match.group(1).replace(',', ''))
                 except ValueError:
-                    continue
-                
-                if qty > 0:
-                    nav = 0.0
-                    nav_match = re.search(r'(?:NAV|Price|Rate)\s*[:\-]?\s*(?:Rs\.?)?\s*([\d,]+\.\d+)', line, re.IGNORECASE)
-                    if not nav_match and i < len(lines) - 1:
-                        nav_match = re.search(r'(?:NAV|Price|Rate)\s*[:\-]?\s*(?:Rs\.?)?\s*([\d,]+\.\d+)', lines[i+1], re.IGNORECASE)
-                        
-                    if nav_match:
+                    pass
+            else:
+                # Fallback: scan multi-line table layouts where quantity details sit directly on subsequent rows
+                balance_keyword_match = re.search(r'(?:Closing\s+Unit\s+Balance|Closing\s+Balance|Balance\s+Units|Balance\s+Value|Units|Balance)', line, re.IGNORECASE)
+                if balance_keyword_match and current_scheme:
+                    num_match = re.search(r'([\d,]+\.\d{2,4})', line)
+                    if num_match:
                         try:
-                            nav = float(nav_match.group(1).replace(',', ''))
+                            qty = float(num_match.group(1).replace(',', ''))
                         except ValueError:
                             pass
-                            
-                    if not any(h['name'] == current_scheme for h in holdings):
-                        holdings.append({
-                            'name': current_scheme,
-                            'class': 'Mutual Fund',
-                            'geo': 'India',
-                            'qty': qty,
-                            'avgCost': nav if nav > 0 else 0.0,
-                            'currentPrice': nav if nav > 0 else 0.0,
-                            'currency': 'INR',
-                            'source': 'CAMS'
-                        })
-                        current_scheme = None
+                    elif i < len(lines) - 1:
+                        num_match = re.search(r'([\d,]+\.\d{2,4})', lines[i+1])
+                        if num_match:
+                            try:
+                                qty = float(num_match.group(1).replace(',', ''))
+                            except ValueError:
+                                pass
+            
+            if qty is not None and qty > 0 and current_scheme:
+                # Seek current NAV in immediate line neighborhood
+                nav = 0.0
+                nav_match = re.search(r'(?:NAV|Price|Rate)\s*[:\-]?\s*(?:Rs\.?)?\s*([\d,]+\.\d+)', line, re.IGNORECASE)
+                if not nav_match and i < len(lines) - 1:
+                    nav_match = re.search(r'(?:NAV|Price|Rate)\s*[:\-]?\s*(?:Rs\.?)?\s*([\d,]+\.\d+)', lines[i+1], re.IGNORECASE)
+                    
+                if nav_match:
+                    try:
+                        nav = float(nav_match.group(1).replace(',', ''))
+                    except ValueError:
+                        pass
+                
+                # Seek associated Cost Value to build average purchase cost heuristics
+                cost_val = None
+                cost_match = re.search(r'(?:Cost\s+Value|Cost|Invested\s+Value|Amount\s+Invested|Cost\s+Value\s*\(Rs\))\s*[:\-]?\s*(?:Rs\.?)?\s*([\d,]+\.\d+)', line, re.IGNORECASE)
+                if not cost_match and i < len(lines) - 1:
+                    cost_match = re.search(r'(?:Cost\s+Value|Cost|Invested\s+Value|Amount\s+Invested|Cost\s+Value\s*\(Rs\))\s*[:\-]?\s*(?:Rs\.?)?\s*([\d,]+\.\d+)', lines[i+1], re.IGNORECASE)
+                
+                if cost_match:
+                    try:
+                        cost_val = float(cost_match.group(1).replace(',', ''))
+                    except ValueError:
+                        pass
+                
+                avg_cost = cost_val / qty if cost_val is not None and qty > 0 else (nav if nav > 0 else 0.0)
+                current_price = nav if nav > 0 else avg_cost
+                
+                if not any(h['name'] == current_scheme for h in holdings):
+                    holdings.append({
+                        'name': current_scheme,
+                        'class': 'Mutual Fund',
+                        'geo': 'India',
+                        'qty': qty,
+                        'avgCost': avg_cost,
+                        'currentPrice': current_price,
+                        'currency': 'INR',
+                        'source': 'CAMS'
+                    })
+                current_scheme = None
+                qty = None
                         
         return holdings
     except Exception as e:
